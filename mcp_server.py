@@ -191,7 +191,6 @@ def _call_vlm(urls,prompt,ak):
     r.raise_for_status();return r.json()["choices"][0]["message"]["content"]
 
 def _call_vlm_video_url(video_url,prompt,ak):
-    """Direct video URL mode - DashScope downloads & analyzes, skip Railway download"""
     h={"Authorization":f"Bearer {ak}","Content-Type":"application/json"}
     p={"model":DASHSCOPE_VISION_MODEL,"input":{"messages":[{"role":"user","content":[{"video":video_url},{"text":prompt}]}]},"parameters":{"max_tokens":4096}}
     r=requests.post(DASHSCOPE_MULTIMODAL_URL,headers=h,json=p,timeout=300)
@@ -262,9 +261,7 @@ def analyze_share_images(share_link:str)->str:
 
 @mcp.tool()
 def analyze_share_video(share_link:str,num_frames:int=8)->str:
-    """从分享链接下载视频，进行双通道分析。
-    1. 🖼️ 画面通道：优先用视频URL直传达DashScope（跳过Railway下载）
-    2. 🎤 音频通道：回退模式下载视频+ASR"""
+    """视频双通道分析：1.直接URL传千问 2.回退下载+ASR"""
     ak=_api_key()
     if not ak:return json.dumps({"status":"error","error":"请设置 DASHSCOPE_API_KEY"},ensure_ascii=False)
     vp=None
@@ -282,12 +279,10 @@ def analyze_share_video(share_link:str,num_frames:int=8)->str:
            "author":info.get("author",{}).get("nickname","")if isinstance(info.get("author"),dict)else info.get("author","")}
         if info.get("music"):
             r["background_music"]=info["music"]["title"]if isinstance(info.get("music"),dict)else info["music"]
-        # 🖼️ 优先：直接传视频URL给DashScope（不经过Railway下载）
         try:
             analysis=_call_vlm_video_url(vu,VIDEO_FULL_PROMPT,ak)
             r["video_mode"]="direct_url";r["visual_analysis"]=analysis
         except Exception:
-            # 回退：下载+抽帧
             vp=_download_video(vu)
             frames=_extract_frames(vp,num_frames)
             r["frames_extracted"]=len(frames)
@@ -296,7 +291,6 @@ def analyze_share_video(share_link:str,num_frames:int=8)->str:
             dur=float(ds)if ds else 30
             analysis=_call_vlm_video(b64s,VIDEO_FULL_PROMPT,ak,round(num_frames/max(dur,1),1))
             r["video_mode"]="downloaded+frames";r["visual_analysis"]=analysis
-            # 🎤 音频（仅下载模式）
             transcript=_extract_audio_and_asr(vp)
             if transcript:r["audio_transcript"]=transcript;r["has_audio"]=True
             else:r["has_audio"]=False;r["audio_note"]="未检测到有效人声"
@@ -311,7 +305,7 @@ def analyze_share_video(share_link:str,num_frames:int=8)->str:
 
 @mcp.tool()
 def extract_share_text(share_link:str)->str:
-    """提取文字内容（抖音ASR/小红书正文）"""
+    """提取文字内容"""
     ak=_api_key()
     if not ak:return json.dumps({"status":"error","error":"请设置 DASHSCOPE_API_KEY"},ensure_ascii=False)
     try:
@@ -331,7 +325,7 @@ def extract_share_text(share_link:str)->str:
             except:
                 info=_douyin_rich_parse(share_link)
                 return json.dumps({"status":"success","platform":"douyin","title":info.get("title",""),
-                                   "text":info.get("title",""),"note":"ASR不可用，返回基础文本"},ensure_ascii=False,indent=2)
+                                   "text":info.get("title",""),"note":"ASR不可用"},ensure_ascii=False,indent=2)
         else:return json.dumps({"status":"error","error":"无法识别链接平台"},ensure_ascii=False)
     except Exception as e:return json.dumps({"status":"error","error":str(e)},ensure_ascii=False)
 
