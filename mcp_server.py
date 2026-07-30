@@ -26,6 +26,7 @@ mcp = FastMCP("Social MCP Server")
 
 DASHSCOPE_VISION_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
 DASHSCOPE_VISION_MODEL = "qwen3-vl-plus"
+DASHSCOPE_MULTIMODAL_URL = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-conversation"
 
 # ── Xiaohongshu constants ──────────────────────────────
 XHS_UA = (
@@ -266,7 +267,7 @@ def _douyin_rich_parse(share_text: str) -> dict:
     video_id = share_response.url.split("?")[0].strip("/").split("/")[-1]
     response = requests.get(f"https://www.iesdouyin.com/share/video/{video_id}", headers=DY_HEADERS)
     response.raise_for_status()
-    match = re.search(r"window\._ROUTER_DATA\s*=\s*(.*?)</script>", response.text, re.DOTALL)
+    match = re.search(r"window\\._ROUTER_DATA\\s*=\\s*(.*?)</script>", response.text, re.DOTALL)
     if not match:
         raise ValueError("从HTML中解析视频信息失败")
     json_data = json.loads(match.group(1).strip())
@@ -275,7 +276,7 @@ def _douyin_rich_parse(share_text: str) -> dict:
     if not key:
         raise Exception("无法从JSON中解析内容")
     item = ld[key]["videoInfoRes"]["item_list"][0]
-    desc = re.sub(r'[\\/:*?"<>|]', '_', item.get("desc", "").strip() or f"douyin_{video_id}")
+    desc = re.sub(r'[\\\\/:*?"<>|]', '_', item.get("desc", "").strip() or f"douyin_{video_id}")
 
     result = {
         "status": "success",
@@ -402,6 +403,68 @@ def _call_vlm(image_urls: list[str], prompt: str, api_key: str) -> str:
     return resp.json()["choices"][0]["message"]["content"]
 
 
+def _call_vlm_video(frame_b64s: list[str], prompt: str, api_key: str, fps: float = 2.0) -> str:
+    """Call DashScope native multimodal API with video frames (tells model these are sequential).
+
+    使用 DashScope 原生 API（非 OpenAI 兼容），以 video 类型传入帧列表 + fps，
+    让模型理解这些是连续的视频帧，而非独立图片。
+    """
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": DASHSCOPE_VISION_MODEL,
+        "input": {
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"video": frame_b64s, "fps": fps},
+                    {"text": prompt},
+                ]
+            }]
+        },
+        "parameters": {"max_tokens": 4096},
+    }
+    resp = requests.post(DASHSCOPE_MULTIMODAL_URL, headers=headers, json=payload, timeout=120)
+    resp.raise_for_status()
+    return resp.json()["output"]["choices"][0]["message"]["content"]
+
+
+def _extract_audio_and_asr(video_path: Path) -> str:
+    """Extract audio from video and run ASR. Returns transcribed text or empty string."""
+    ffmpeg = _find_bin("ffmpeg")
+    audio_path = video_path.with_suffix(".mp3")
+    try:
+        subprocess.run(
+            [ffmpeg, "-y", "-i", str(video_path), "-vn", "-acodec", "libmp3lame",
+             "-q:a", "4", str(audio_path)],
+            capture_output=True, timeout=120, check=True,
+        )
+    except Exception:
+        return ""  # 无法提取音频
+
+    if not audio_path.exists() or audio_path.stat().st_size < 1024:
+        return ""
+
+    # 用 SiliconFlow ASR（和 douyin_downloader 同一套）
+    api_key = os.getenv("API_KEY") or os.getenv("DASHSCOPE_API_KEY")
+    if not api_key:
+        return ""
+
+    try:
+        ASR_URL = "https://api.siliconflow.cn/v1/audio/transcriptions"
+        with open(audio_path, "rb") as f:
+            files = {"file": (audio_path.name, f, "audio/mpeg"), "model": (None, "FunAudioLLM/SenseVoiceSmall")}
+            headers = {"Authorization": f"Bearer {api_key}"}
+            resp = requests.post(ASR_URL, files=files, headers=headers, timeout=120)
+            resp.raise_for_status()
+            text = resp.json().get("text", "").strip()
+            return text if text else ""
+    except Exception:
+        return ""
+    finally:
+        if audio_path.exists():
+            audio_path.unlink(missing_ok=True)
+
+
 # ══════════════════════════════════════════════════════════
 #  MCP Tools
 # ══════════════════════════════════════════════════════════
@@ -496,19 +559,33 @@ def analyze_share_images(share_link: str) -> str:
         return json.dumps({"status": "error", "error": str(e)}, ensure_ascii=False)
 
 
+VIDEO_FULL_PROMPT = (
+    "请分析这段视频的完整内容。详细描述：\n"
+    "1. 画面中的场景和人物/动物，以及画面的变化过程\n"
+    "2. 任何文字内容（标题、字幕、贴纸、水印）\n"
+    "3. 风格、氛围和主题\n"
+    "4. 动作、表情、互动，按时间顺序描述发生了什么事\n"
+    "请用中文详细描述整段视频的完整脉络"
+)
+
+
 @mcp.tool()
-def analyze_share_video(share_link: str, num_frames: int = 5) -> str:
+def analyze_share_video(share_link: str, num_frames: int = 8) -> str:
     """
-    从分享链接下载视频，提取关键帧，并用视觉模型分析画面内容。
+    从分享链接下载视频，进行双通道分析。
+    
+    双通道：
+    1. 🖼️ 画面通道：抽帧+千问VL分析（DashScope原生视频帧模式，告知模型这是连续视频）
+    2. 🎤 音频通道：提取音频+ASR转文字（有人声时）
     
     支持抖音视频和小红书视频。
     
     参数:
     - share_link: 分享链接
-    - num_frames: 抽取帧数（默认5张，越多越详细但消耗更多额度）
+    - num_frames: 抽取帧数（默认8张，越多越详细但消耗更多额度）
     
     返回:
-    - 视频画面内容的文字描述
+    - 画面分析 + 音频文字 + 视频完整脉络
     """
     api_key = _api_key()
     if not api_key:
@@ -518,6 +595,7 @@ def analyze_share_video(share_link: str, num_frames: int = 5) -> str:
     try:
         platform = _detect_platform(share_link)
         
+        # ── 1. 解析链接获取视频URL ─────────────────
         if platform == "xiaohongshu":
             info = parse_xiaohongshu_note(share_link)
             if info.get("status") != "success":
@@ -539,16 +617,39 @@ def analyze_share_video(share_link: str, num_frames: int = 5) -> str:
             "author": info.get("author", {}).get("nickname", "") if isinstance(info.get("author"), dict) else info.get("author", ""),
         }
         
+        if info.get("music"):
+            result["background_music"] = info["music"]["title"] if isinstance(info.get("music"), dict) else info["music"]
+        
+        # ── 2. 下载视频 ────────────────────────────
         video_path = _download_video(video_url)
+        
+        # ── 3. 🖼️ 画面通道：抽帧 + DashScope视频帧模式 ──
         frames = _extract_frames(video_path, num_frames)
         result["frames_extracted"] = len(frames)
         
         frame_b64s = [_image_to_base64(f) for f in frames]
-        analysis = _call_vlm(frame_b64s, VIDEO_ANALYZE_PROMPT, api_key)
-        result["analysis"] = analysis
         
-        if info.get("music"):
-            result["background_music"] = info["music"]["title"] if isinstance(info.get("music"), dict) else info["music"]
+        # 计算fps：让模型知道这些帧之间的时间间隔
+        dur_str = subprocess.check_output(
+            [_find_bin("ffprobe"), "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
+            timeout=15
+        ).decode().strip()
+        dur = float(dur_str) if dur_str else 30
+        fps = round(num_frames / max(dur, 1), 1)
+        
+        # 使用DashScope原生视频帧模式（告知模型这些是连续视频帧）
+        analysis = _call_vlm_video(frame_b64s, VIDEO_FULL_PROMPT, api_key, fps=fps)
+        result["visual_analysis"] = analysis
+        
+        # ── 4. 🎤 音频通道：提取 + ASR ──────────────
+        transcript = _extract_audio_and_asr(video_path)
+        if transcript:
+            result["audio_transcript"] = transcript
+            result["has_audio"] = True
+        else:
+            result["has_audio"] = False
+            result["audio_note"] = "未检测到有效人声（可能是纯BGM/环境音视频）"
         
         return json.dumps(result, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -558,6 +659,9 @@ def analyze_share_video(share_link: str, num_frames: int = 5) -> str:
             video_path.unlink(missing_ok=True)
             for f in Path(video_path.parent).glob("frame_*.jpg"):
                 f.unlink(missing_ok=True)
+            audio_p = video_path.with_suffix(".mp3")
+            if audio_p.exists():
+                audio_p.unlink(missing_ok=True)
 
 
 @mcp.tool()
