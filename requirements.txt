@@ -1,0 +1,9 @@
+mcp>=1.0.0
+requests
+ffmpeg-python
+tqdm
+dashscope
+fastapi
+uvicorn
+pydantic
+fastmcp>=2.14
