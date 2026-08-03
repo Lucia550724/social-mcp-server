@@ -170,11 +170,17 @@ def ex_fr(vp,n=5):
     return fs
 def b64(p):
     with open(p,"rb")as f:return f"data:image/jpeg;base64,{base64.b64encode(f.read()).decode()}"
+def dl_img_b64(url, timeout=20):
+    """下载图片转 base64（2026-08-03 优化：带 UA/Referer，避免防盗链导致模型拉不到图）"""
+    h={"User-Agent":XHS_UA,"Referer":"https://www.xiaohongshu.com/"}
+    r=requests.get(url,headers=h,timeout=timeout)
+    r.raise_for_status()
+    return f"data:image/jpeg;base64,{base64.b64encode(r.content).decode()}"
 def call_vlm(urls,prompt,k):
     h={"Authorization":f"Bearer {k}","Content-Type":"application/json"}
     ct=[{"type":"text","text":prompt}]
     for u in urls:ct.append({"type":"image_url","image_url":{"url":u}})
-    r=requests.post(VL_URL,headers=h,json={"model":VL_MODEL,"messages":[{"role":"user","content":ct}],"max_tokens":4096},timeout=120)
+    r=requests.post(VL_URL,headers=h,json={"model":VL_MODEL,"messages":[{"role":"user","content":ct}],"max_tokens":4096},timeout=180)
     r.raise_for_status();return r.json()["choices"][0]["message"]["content"]
 def asr(vp):
     ffe=fb("ffmpeg");ap=vp.with_suffix(".mp3")
@@ -225,14 +231,23 @@ def analyze_share_images(s:str)->str:
         r={"status":"success","platform":p,"title":i.get("title",""),
            "author":i.get("author",{}).get("nickname","")if isinstance(i.get("author"),dict)else i.get("author",""),
            "image_count":len(us),"image_analysis":[]}
-        for i2,u in enumerate(us):
-            r["image_analysis"].append({"image_index":i2+1,"url":u,"content":call_vlm([u],IMG_PROMPT,k)})
+        # 2026-08-03 优化：图片先下载转b64（防盗链）+ 并发识图（多张图耗时≈单张）+ 单张失败降级
+        from concurrent.futures import ThreadPoolExecutor
+        def one(idx_u):
+            idx, u = idx_u
+            try:
+                b = dl_img_b64(u)
+                return {"image_index":idx+1,"url":u,"content":call_vlm([b],IMG_PROMPT,k)}
+            except Exception as e:
+                return {"image_index":idx+1,"url":u,"content":f"[该图识别失败] {e}"}
+        with ThreadPoolExecutor(max_workers=min(4, len(us))) as ex:
+            r["image_analysis"] = list(ex.map(one, enumerate(us)))
         return json.dumps(r,ensure_ascii=False,indent=2)
     except Exception as e:return json.dumps({"status":"error","error":str(e)},ensure_ascii=False)
 
 @mcp.tool()
-def analyze_share_video(s:str,n: int = 8)->str:
-    """视频分析：下载+抽帧+ASR音频转文字"""
+def analyze_share_video(s:str,n: int = 4)->str:
+    """视频分析：下载+抽帧+ASR音频转文字（2026-08-03：默认4帧，画面分析失败不丢ASR）"""
     k=ak()
     if not k:return json.dumps({"status":"error","error":"请设置API_KEY"},ensure_ascii=False)
     vp=None
@@ -257,9 +272,13 @@ def analyze_share_video(s:str,n: int = 8)->str:
         r["frames_extracted"]=len(frames)
         b=[b64(f)for f in frames]
         
-        # 画面分析
-        analysis=call_vlm(b,VID_PROMPT,k)
-        r["visual_analysis"]=analysis
+        # 画面分析（失败降级，不丢后续ASR结果）
+        try:
+            analysis=call_vlm(b,VID_PROMPT,k)
+            r["visual_analysis"]=analysis
+        except Exception as e:
+            r["visual_analysis"]=None
+            r["visual_note"]=f"画面分析失败: {e}"
         
         # 音频ASR
         t=asr(vp)
