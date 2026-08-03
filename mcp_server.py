@@ -53,7 +53,7 @@ def xhs_s(h):
     if b<0:return None
     r=xhs_b(h[b:])
     if not r:return None
-    try:return json.loads(re.sub(r"([:,\[]\s*)undefined\b",r"\1null",r))
+    try:return json.loads(re.sub(r"([:,\[\]\s*)undefined\b",r"\1null",r))
     except:return None
 def xhs_n(s):
     try:
@@ -113,12 +113,12 @@ def dy_p(t):
     if not us:raise ValueError("无效链接")
     sr=requests.get(us[0],headers=DY_HEADERS);vid=sr.url.split("?")[0].strip("/").split("/")[-1]
     r=requests.get(f"https://www.iesdouyin.com/share/video/{vid}",headers=DY_HEADERS);r.raise_for_status()
-    m=re.search(r"window\._ROUTER_DATA\s*=\s*(.*?)</script>",r.text,re.DOTALL)
+    m=re.search(r"window\\._ROUTER_DATA\\s*=\\s*(.*?)</script>",r.text,re.DOTALL)
     if not m:raise ValueError("解析失败")
     jd=json.loads(m.group(1).strip());ld=jd["loaderData"]
     k="video_(id)/page"if"video_(id)/page"in ld else("note_(id)/page"if"note_(id)/page"in ld else None)
     if not k:raise Exception("解析失败")
-    item=ld[k]["videoInfoRes"]["item_list"][0];desc=re.sub(r'[\\/:*?"<>|]','_',item.get("desc","").strip()or f"douyin_{vid}")
+    item=ld[k]["videoInfoRes"]["item_list"][0];desc=re.sub(r'[\\\\/:*?"<>|]','_',item.get("desc","").strip()or f"douyin_{vid}")
     res={"status":"success","platform":"douyin","video_id":vid,"title":desc,"content_type":"video","images":[],"image_count":0,"video_url":None,"cover_url":None,"author":None,"music":None}
     if"author"in item:
         a=item["author"];av=a.get("avatar_thumb",{}).get("url_list")
@@ -164,18 +164,31 @@ def ex_fr(vp,n=5):
     iv=max(dur/(n+1),1)
     for i in range(n):
         fp=vp.with_name(f"f{i}.jpg")
-        subprocess.run([ffe,"-y","-ss",str(iv*(i+1)),"-i",str(vp),"-vframes","1","-q:v","2",str(fp)],capture_output=True,timeout=30)
+        subprocess.run([ffe,"-y","-ss",str(iv*(i+1)),"-i",str(vp),"-vframes","1","-q:v","5",str(fp)],capture_output=True,timeout=30)
         if fp.exists():fs.append(fp)
     if not fs:raise Exception("未能提取帧")
     return fs
 def b64(p):
     with open(p,"rb")as f:return f"data:image/jpeg;base64,{base64.b64encode(f.read()).decode()}"
-def dl_img_b64(url, timeout=20):
-    """下载图片转 base64（2026-08-03 优化：带 UA/Referer，避免防盗链导致模型拉不到图）"""
+def dl_img_b64(url, timeout=20, max_side=768):
+    """下载图片转 base64（2026-08-03 优化：带 UA/Referer 防防盗链 + ffmpeg 压缩到最长边768，减少传输/推理耗时）"""
     h={"User-Agent":XHS_UA,"Referer":"https://www.xiaohongshu.com/"}
     r=requests.get(url,headers=h,timeout=timeout)
     r.raise_for_status()
-    return f"data:image/jpeg;base64,{base64.b64encode(r.content).decode()}"
+    data=r.content
+    if len(data) > 200_000:
+        try:
+            ffe=fb("ffmpeg")
+            inp=Path(tempfile.NamedTemporaryFile(suffix=".img",delete=False).name)
+            outp=Path(tempfile.NamedTemporaryFile(suffix=".jpg",delete=False).name)
+            inp.write_bytes(data)
+            subprocess.run([ffe,"-y","-i",str(inp),"-vf",f"scale='min({max_side},iw)':-2","-q:v","5",str(outp)],capture_output=True,timeout=15)
+            if outp.exists() and outp.stat().st_size > 0:
+                data=outp.read_bytes()
+            inp.unlink(missing_ok=True); outp.unlink(missing_ok=True)
+        except Exception:
+            pass
+    return f"data:image/jpeg;base64,{base64.b64encode(data).decode()}"
 def call_vlm(urls,prompt,k):
     h={"Authorization":f"Bearer {k}","Content-Type":"application/json"}
     ct=[{"type":"text","text":prompt}]
